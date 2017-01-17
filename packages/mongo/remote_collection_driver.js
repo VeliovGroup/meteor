@@ -1,7 +1,6 @@
 MongoInternals.RemoteCollectionDriver = function (
   mongo_url, options) {
-  var self = this;
-  self.mongo = new MongoConnection(mongo_url, options);
+  this.mongo = new MongoConnection(mongo_url, options);
 };
 
 _.extend(MongoInternals.RemoteCollectionDriver.prototype, {

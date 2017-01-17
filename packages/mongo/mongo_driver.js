@@ -606,8 +606,9 @@ var isModificationMod = function (mod) {
 };
 
 var transformResult = function (driverResult) {
-  var meteorResult = { numberAffected: 0 };
-  if (driverResult) {
+  var meteorResult = { numberAffected: (_.isNumber(driverResult)) ? driverResult : 0 };
+
+  if (driverResult && driverResult.result) {
     var mongoResult = driverResult.result;
 
     // On updates with upsert:true, the inserted values come as a list of
@@ -636,13 +637,17 @@ MongoConnection._isCannotChangeIdError = function (err) {
   // checks should work, but just to be safe...
   if (err.code === 13596)
     return true;
-  if (err.errmsg.indexOf("cannot change _id of a document") === 0)
+
+  // Mongo 3.2.* returns error in next form:
+  // {name: String, code: Number, err: String}
+  var error = err.errmsg || err.err;
+  if (error.indexOf("cannot change _id of a document") === 0)
     return true;
 
   // Now look for what it looks like in Mongo 2.6.  We don't use the error code
   // here, because the error code we observed it producing (16837) appears to be
   // a far more generic error code based on examining the source.
-  if (err.errmsg.indexOf("The _id field cannot be changed") === 0)
+  if (error.indexOf("The _id field cannot be changed") === 0)
     return true;
 
   return false;
@@ -730,7 +735,11 @@ var simulateUpsertWithInsertedId = function (collection, selector, mod,
                         bindEnvironmentForWrite(function (err, result) {
                           if (err) {
                             callback(err);
-                          } else if (result && result.result.n != 0) {
+                          } else if (_.isNumber(result)) {
+                            callback(null, {
+                              numberAffected: result
+                            });
+                          } else if (result && result.result && result.result.n != 0) {
                             callback(null, {
                               numberAffected: result.result.n
                             });
@@ -758,7 +767,7 @@ var simulateUpsertWithInsertedId = function (collection, selector, mod,
                           }
                         } else {
                           callback(null, {
-                            numberAffected: result.result.upserted.length,
+                            numberAffected: (_.isNumber(result)) ? result : result.result.upserted.length,
                             insertedId: insertedId,
                           });
                         }
