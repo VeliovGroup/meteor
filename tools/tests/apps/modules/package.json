@@ -13,10 +13,11 @@
     "mssql": "^3.1.1",
     "regenerator-runtime": "^0.9.5",
     "stripe": "^4.4.0",
-    "winston": "^2.2.0"
+    "winston": "^2.3.1"
   },
   "scripts": {
-    "test": "METEOR_PROFILE=100 ../../../../meteor test --full-app --driver-package avital:mocha",
-    "test-packages": "../../../../meteor test-packages --driver-package avital:mocha packages/modules-test-package"
+    "test": "METEOR_PROFILE=100 ../../../../meteor test --full-app --driver-package dispatch:mocha-phantomjs",
+    "browser": "METEOR_PROFILE=100 ../../../../meteor test --full-app --driver-package dispatch:mocha-browser",
+    "test-packages": "../../../../meteor test-packages --driver-package dispatch:mocha-phantomjs packages/modules-test-package"
   }
 }

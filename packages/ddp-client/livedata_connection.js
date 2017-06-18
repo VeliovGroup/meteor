@@ -1,3 +1,6 @@
+import { DDP, LivedataTest } from "./namespace.js";
+import { MongoIDMap } from "./id_map.js";
+
 if (Meteor.isServer) {
   var path = Npm.require('path');
   var Fiber = Npm.require('fibers');
@@ -299,29 +302,22 @@ var Connection = function (url, options) {
     if (self._outstandingMethodBlocks.length > 0) {
       // If there is an outstanding method block, we only care about the first one as that is the
       // one that could have already sent messages with no response, that are not allowed to retry.
-      _.each(self._outstandingMethodBlocks[0].methods, function(methodInvoker) {
-        // If the message wasn't sent or it's allowed to retry, do nothing.
+      const currentMethodBlock = self._outstandingMethodBlocks[0].methods;
+      self._outstandingMethodBlocks[0].methods = currentMethodBlock.filter((methodInvoker) => {
+
+        // Methods with 'noRetry' option set are not allowed to re-send after
+        // recovering dropped connection.
         if (methodInvoker.sentMessage && methodInvoker.noRetry) {
-          // The next loop serves to get the index in the current method block of this method.
-          var currentMethodBlock = self._outstandingMethodBlocks[0].methods;
-          var loopMethod;
-          for (var i = 0; i < currentMethodBlock.length; i++) {
-            loopMethod = currentMethodBlock[i];
-            if (loopMethod.methodId === methodInvoker.methodId) {
-              break;
-            }
-          }
-
-          // Remove from current method block. This may leave the block empty, but we
-          // don't move on to the next block until the callback has been delivered, in
-          // _outstandingMethodFinished.
-          currentMethodBlock.splice(i, 1);
-
           // Make sure that the method is told that it failed.
           methodInvoker.receiveResult(new Meteor.Error('invocation-failed',
             'Method invocation might have failed due to dropped connection. ' +
             'Failing because `noRetry` option was passed to Meteor.apply.'));
         }
+
+        // Only keep a method if it wasn't sent or it's allowed to retry.
+        // This may leave the block empty, but we don't move on to the next
+        // block until the callback has been delivered, in _outstandingMethodFinished.
+        return !(methodInvoker.sentMessage && methodInvoker.noRetry);
       });
     }
 
@@ -761,6 +757,7 @@ _.extend(Connection.prototype, {
    * @param {Boolean} options.wait (Client only) If true, don't send this method until all previous method calls have completed, and don't send any subsequent method calls until this one is completed.
    * @param {Function} options.onResultReceived (Client only) This callback is invoked with the error or result of the method (just like `asyncCallback`) as soon as the error or result is available. The local cache may not yet reflect the writes performed by the method.
    * @param {Boolean} options.noRetry (Client only) if true, don't send this method again on reload, simply call the callback an error with the error code 'invocation-failed'.
+   * @param {Boolean} options.throwStubExceptions (Client only) If true, exceptions thrown by method stubs will be thrown instead of logged, and the method will not be invoked on the server.
    * @param {Function} [asyncCallback] Optional callback; same semantics as in [`Meteor.call`](#meteor_call).
    */
   apply: function (name, args, options, callback) {
@@ -798,7 +795,7 @@ _.extend(Connection.prototype, {
       };
     })();
 
-    var enclosing = DDP._CurrentInvocation.get();
+    var enclosing = DDP._CurrentMethodInvocation.get();
     var alreadyInSimulation = enclosing && enclosing.isSimulation;
 
     // Lazily generate a randomSeed, only if it is requested by the stub.
@@ -850,7 +847,7 @@ _.extend(Connection.prototype, {
       try {
         // Note that unlike in the corresponding server code, we never audit
         // that stubs check() their arguments.
-        var stubReturnValue = DDP._CurrentInvocation.withValue(invocation, function () {
+        var stubReturnValue = DDP._CurrentMethodInvocation.withValue(invocation, function () {
           if (Meteor.isServer) {
             // Because saveOriginals and retrieveOriginals aren't reentrant,
             // don't allow stubs to yield.
@@ -977,6 +974,8 @@ _.extend(Connection.prototype, {
   // documents.
   _saveOriginals: function () {
     var self = this;
+    if (!self._waitingForQuiescence())
+      self._flushBufferedWrites();
     _.each(self._stores, function (s) {
       s.saveOriginals();
     });

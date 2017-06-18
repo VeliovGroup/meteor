@@ -701,7 +701,18 @@ main.registerCommand({
   maxArgs: 1,
   options: {
     'create-track': { type: Boolean },
-    'from-checkout': { type: Boolean }
+    'from-checkout': { type: Boolean },
+    // Normally the publish-release script will complain if the source of
+    // a core package differs in any way from what was previously
+    // published for the current version of the package. However, if the
+    // package was deliberately republished independently from a Meteor
+    // release, and those changes have not yet been merged to the master
+    // branch, then the complaint may be spurious. If you have verified
+    // that current release contains no meaningful changes (since the
+    // previous official release) to the packages that are being
+    // complained about, then you can pass the --skip-tree-hashing flag to
+    // disable the treeHash check.
+    'skip-tree-hashing': { type: Boolean },
   },
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
 }, function (options) {
@@ -949,7 +960,11 @@ main.registerCommand({
               // haven't bumped the version number yet; either way,
               // you should probably bump the version number.
               somethingChanged = true;
-            } else {
+            } else if (! options["skip-tree-hashing"] ||
+                       // Always check the treeHash of the meteor-tool
+                       // package, since it must have been modified if a
+                       // new release is being published.
+                       packageName === "meteor-tool") {
               // Save the isopack, just to get its hash.
               var bundleBuildResult = packageClient.bundleBuild(
                 isopk,
@@ -1645,6 +1660,23 @@ main.registerCommand({
 
     upgradePackageNames = options.args;
   }
+  // We want to use the project's release for constraints even if we are
+  // currently running a newer release (eg if we ran 'meteor update --patch' and
+  // updated to an older patch release).  (If the project has release 'none'
+  // because this is just 'updating packages', this can be null. Also, if we're
+  // running from a checkout this should be null even if the file doesn't say
+  // 'none'.)
+  var releaseRecordForConstraints = null;
+  if (! files.inCheckout() &&
+      projectContext.releaseFile.normalReleaseSpecified()) {
+    releaseRecordForConstraints = catalog.official.getReleaseVersion(
+      projectContext.releaseFile.releaseTrack,
+      projectContext.releaseFile.releaseVersion);
+    if (! releaseRecordForConstraints) {
+      throw Error("unknown release " +
+                  projectContext.releaseFile.displayReleaseName);
+    }
+  }
 
   const upgradePackagesWithoutCordova =
     upgradePackageNames.filter(name => name.split(':')[0] !== 'cordova');
@@ -1676,6 +1708,7 @@ main.registerCommand({
 
   // Try to resolve constraints, allowing the given packages to be upgraded.
   projectContext.reset({
+    releaseForConstraints: releaseRecordForConstraints,
     upgradePackageNames: upgradePackageNames,
     upgradeIndirectDepPatchVersions: upgradeIndirectDepPatchVersions
   });
@@ -1755,8 +1788,10 @@ main.registerCommand({
                    " are available:");
       _.each(nonlatestIndirectDeps, printItem);
       Console.info([
-        "To update one or more of these packages, pass their names to ",
-        "`meteor update`, or just run `meteor update --all-packages`."
+        "These versions may not be compatible with your project.",
+        "To update one or more of these packages to their latest",
+        "compatible versions, pass their names to `meteor update`,",
+        "or just run `meteor update --all-packages`.",
       ].join("\n"));
     }
   }

@@ -21,6 +21,10 @@ Babel = {
   // Deprecated, now a no-op.
   validateExtraFeatures: Function.prototype,
 
+  parse: function (source) {
+    return Npm.require('meteor-babel').parse(source);
+  },
+
   compile: function (source, options) {
     var meteorBabel = Npm.require('meteor-babel');
     options = options || getDefaultOptions();
@@ -29,5 +33,11 @@ Babel = {
 
   setCacheDir: function (cacheDir) {
     Npm.require('meteor-babel').setCacheDir(cacheDir);
+  },
+
+  minify: function(source, options) {
+    var meteorBabel = Npm.require('meteor-babel');
+    var options = options || meteorBabel.getMinifierOptions();
+    return meteorBabel.minify(source, options);
   }
 };

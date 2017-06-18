@@ -1,6 +1,5 @@
 Facebook = {};
-
-var querystring = Npm.require('querystring');
+var crypto = Npm.require('crypto');
 
 Facebook.handleAuthFromAccessToken = function handleAuthFromAccessToken(accessToken, expiresAt) {
   // include all fields from facebook
@@ -54,30 +53,21 @@ var getTokenResponse = function (query) {
   try {
     // Request an access token
     responseContent = HTTP.get(
-      "https://graph.facebook.com/v2.2/oauth/access_token", {
+      "https://graph.facebook.com/v2.8/oauth/access_token", {
         params: {
           client_id: config.appId,
           redirect_uri: OAuth._redirectUri('facebook', config),
           client_secret: OAuth.openSecret(config.secret),
           code: query.code
         }
-      }).content;
+      }).data;
   } catch (err) {
     throw _.extend(new Error("Failed to complete OAuth handshake with Facebook. " + err.message),
                    {response: err.response});
   }
 
-  // If 'responseContent' parses as JSON, it is an error.
-  // XXX which facebook error causes this behvaior?
-  if (isJSON(responseContent)) {
-    throw new Error("Failed to complete OAuth handshake with Facebook. " + responseContent);
-  }
-
-  // Success!  Extract the facebook access token and expiration
-  // time from the response
-  var parsedResponse = querystring.parse(responseContent);
-  var fbAccessToken = parsedResponse.access_token;
-  var fbExpires = parsedResponse.expires;
+  var fbAccessToken = responseContent.access_token;
+  var fbExpires = responseContent.expires_in;
 
   if (!fbAccessToken) {
     throw new Error("Failed to complete OAuth handshake with facebook " +
@@ -90,11 +80,21 @@ var getTokenResponse = function (query) {
 };
 
 var getIdentity = function (accessToken, fields) {
+  var config = ServiceConfiguration.configurations.findOne({service: 'facebook'});
+  if (!config)
+    throw new ServiceConfiguration.ConfigError();
+
+  // Generate app secret proof that is a sha256 hash of the app access token, with the app secret as the key
+  // https://developers.facebook.com/docs/graph-api/securing-requests#appsecret_proof
+  var hmac = crypto.createHmac('sha256', OAuth.openSecret(config.secret));
+  hmac.update(accessToken);
+
   try {
-    return HTTP.get("https://graph.facebook.com/v2.4/me", {
+    return HTTP.get("https://graph.facebook.com/v2.8/me", {
       params: {
         access_token: accessToken,
-        fields: fields
+        appsecret_proof: hmac.digest('hex'),
+        fields: fields.join(",")
       }
     }).data;
   } catch (err) {

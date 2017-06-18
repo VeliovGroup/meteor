@@ -434,6 +434,9 @@ function copyNpmPackageWithSymlinkedNodeModules(fromPkgDir, toPkgDir) {
 
 const portableCache = Object.create(null);
 
+// Increment this version to trigger the full portability check again.
+const portableVersion = 1;
+
 const isPortable = Profile("meteorNpm.isPortable", dir => {
   const lstat = optimisticLStat(dir);
   if (! lstat.isDirectory()) {
@@ -441,9 +444,11 @@ const isPortable = Profile("meteorNpm.isPortable", dir => {
     return ! dir.endsWith(".node");
   }
 
-  const pkgJsonStat = optimisticStatOrNull(files.pathJoin(dir, "package.json"));
+  const pkgJsonPath = files.pathJoin(dir, "package.json");
+  const pkgJsonStat = optimisticStatOrNull(pkgJsonPath);
   const canCache = pkgJsonStat && pkgJsonStat.isFile();
-  const portableFile = files.pathJoin(dir, ".meteor-portable");
+  const portableFile = files.pathJoin(
+    dir, ".meteor-portable-" + portableVersion + ".json");
 
   if (canCache) {
     // Cache previous results by writing a boolean value to a hidden file
@@ -470,10 +475,26 @@ const isPortable = Profile("meteorNpm.isPortable", dir => {
     fs.unlink(portableFile, error => {});
   }
 
-  const result = optimisticReaddir(dir).every(
-    // Ignore files that start with a ".", such as .bin directories.
-    itemName => itemName.startsWith(".") ||
-      isPortable(files.pathJoin(dir, itemName)));
+  const pkgJson = canCache && optimisticReadJsonOrNull(pkgJsonPath, {
+    // A syntactically incorrect `package.json` isn't likely to have other
+    // effects since the npm itself likely won't install but the developer has
+    // no control over that happening so we should allow this.
+    allowSyntaxError: true
+  });
+
+  const hasBuildScript =
+    pkgJson &&
+    pkgJson.scripts &&
+    (pkgJson.scripts.preinstall ||
+     pkgJson.scripts.install ||
+     pkgJson.scripts.postinstall);
+
+  const result = hasBuildScript
+    ? false // Build scripts may not be portable.
+    : optimisticReaddir(dir).every(
+      // Ignore files that start with a ".", such as .bin directories.
+      itemName => itemName.startsWith(".") ||
+        isPortable(files.pathJoin(dir, itemName)));
 
   if (canCache) {
     // Write the .meteor-portable file asynchronously, and don't worry
@@ -608,24 +629,39 @@ var updateExistingNpmDirectory = function (packageName, newPackageNpmDir,
     logUpdateDependencies(packageName, npmDependencies);
   }
 
+  makeNewPackageNpmDir(newPackageNpmDir);
+
   let preservedShrinkwrap;
 
   if (_.isEmpty(npmDependencies)) {
     // If there are no npmDependencies, make sure nothing is installed.
     preservedShrinkwrap = { dependencies: {} };
+
   } else if (isSubtreeOf(npmTree, minShrinkwrapTree)) {
     // If the top-level npm dependencies are already encompassed by the
     // npm-shrinkwrap.json file, then reuse that file.
     preservedShrinkwrap = shrinkwrappedDependenciesTree;
+
   } else {
-    // Otherwise install only the required npm packages and their
-    // dependencies.
-    preservedShrinkwrap = npmTree;
+    // Otherwise install npmTree.dependencies as if we were creating a new
+    // .npm/package directory, and leave preservedShrinkwrap empty.
+    _.each(npmTree.dependencies, (info, name) => {
+      installNpmModule(name, info.version, newPackageNpmDir);
+    });
+
+    // Note: as of npm@4.0.0, npm-shrinkwrap.json files are regarded as
+    // "canonical," meaning `npm install` (without a package argument)
+    // will only install dependencies mentioned in npm-shrinkwrap.json.
+    // That's why we can't just update installedDependenciesTree to
+    // include npmTree.dependencies and hope for the best, because if the
+    // new versions of the required top-level packages have any additional
+    // transitive dependencies, those dependencies will not be installed
+    // unless previously mentioned in npm-shrinkwrap.json. Reference:
+    // https://github.com/npm/npm/blob/latest/CHANGELOG.md#no-more-partial-shrinkwraps-breaking
   }
 
-  makeNewPackageNpmDir(newPackageNpmDir);
-
-  if (!_.isEmpty(preservedShrinkwrap.dependencies)) {
+  if (! _.isEmpty(preservedShrinkwrap &&
+                  preservedShrinkwrap.dependencies)) {
     const newShrinkwrapFile = files.pathJoin(
       newPackageNpmDir,
       'npm-shrinkwrap.json'
@@ -909,38 +945,34 @@ var getShrinkwrappedDependencies = function (dir) {
   return treeToDependencies(getShrinkwrappedDependenciesTree(dir));
 };
 
-var installNpmModule = function (name, version, dir) {
+const installNpmModule = meteorNpm.installNpmModule = (name, version, dir) => {
 
-  var installArg = utils.isNpmUrl(version)
-    ? version : (name + "@" + version);
+  const installArg = utils.isNpmUrl(version)
+    ? version
+    : `${name}@${version}`;
 
   // We don't use npm.commands.install since we couldn't figure out
   // how to silence all output (specifically the installed tree which
   // is printed out with `console.log`)
-  //
-  // We used to use --force here, because the NPM cache is broken! See
-  // https://github.com/npm/npm/issues/3265 Basically, switching
-  // back and forth between a tarball fork of version X and the real
-  // version X could confuse NPM. But the main reason to use tarball
-  // URLs is to get a fork of the latest version with some fix, so
-  // it was easy to trigger this!
-  //
-  // We now use a forked version of npm with our PR
-  // https://github.com/npm/npm/pull/5137 to work around this.
-  var result = runNpmCommand(["install", installArg], dir);
+  const result = runNpmCommand(["install", installArg], dir);
 
   if (! result.success) {
-    var pkgNotFound = "404 '" + utils.quotemeta(name) +
-          "' is not in the npm registry";
-    var versionNotFound = "version not found: " + utils.quotemeta(name) +
-          '@' + utils.quotemeta(version);
+    const pkgNotFound =
+      `404  '${utils.quotemeta(name)}' is not in the npm registry`;
+
+    const versionNotFound =
+      "No compatible version found: " +
+      `${utils.quotemeta(name)}@${utils.quotemeta(version)}`;
+
     if (result.stderr.match(new RegExp(pkgNotFound))) {
-      buildmessage.error("there is no npm package named '" + name + "'");
+      buildmessage.error(
+        `there is no npm package named '${name}' in the npm registry`);
     } else if (result.stderr.match(new RegExp(versionNotFound))) {
-      buildmessage.error(name + " version " + version + " " +
-                         "is not available in the npm registry");
+      buildmessage.error(
+        `${name} version ${version} is not available in the npm registry`);
     } else {
-      buildmessage.error(`couldn't install npm package ${name}@${version}: ${result.error}`);
+      buildmessage.error(
+        `couldn't install npm package ${name}@${version}: ${result.error}`);
     }
 
     // Recover by returning false from updateDependencies

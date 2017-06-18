@@ -154,7 +154,7 @@ describe("css modules", () => {
     // beginning of the <head>. If the corresponding module ever gets
     // imported, its module.exports object should be an empty stub, rather
     // than a <style> node added dynamically to the <head>.
-    assert.deepEqual(require("./eager.css"), {});
+    assert.deepEqual(Object.keys(require("./eager.css")), []);
   });
 
   it("should be importable by an app", () => {
@@ -219,18 +219,12 @@ describe("native node_modules", () => {
   });
 
   it("can all be imported", () => {
-    require("_stream_duplex");
-    require("_stream_passthrough");
-    require("_stream_readable");
-    require("_stream_transform");
-    require("_stream_writable");
     require("assert");
     require("buffer");
     require("child_process");
     require("cluster");
     require("console");
     require("constants");
-    require("crypto");
     require("dgram");
     require("dns");
     require("domain");
@@ -248,6 +242,11 @@ describe("native node_modules", () => {
     require("readline");
     require("repl");
     require("stream");
+    require("_stream_duplex");
+    require("_stream_passthrough");
+    require("_stream_readable");
+    require("_stream_transform");
+    require("_stream_writable");
     require("string_decoder");
     require("sys");
     require("timers");
@@ -257,6 +256,16 @@ describe("native node_modules", () => {
     require("util");
     require("vm");
     require("zlib");
+
+    // The crypto package automatically polyfills global.Buffer on the
+    // client, so save it for last to ensure that none of the packages
+    // above depend on global.Buffer.
+    require("crypto");
+  });
+
+  Meteor.isClient &&
+  it('should return Module from require("module")', () => {
+    assert.ok(module instanceof require("module"));
   });
 });
 
@@ -374,7 +383,6 @@ describe("Meteor packages", () => {
 
     } else {
       assert.deepEqual(require("meteor/client-only-ecmascript"), {
-        __esModule: true,
         name: "client-only-ecmascript",
         imported: "/node_modules/meteor/client-only-ecmascript/imported.js",
         ClientTypeof: {

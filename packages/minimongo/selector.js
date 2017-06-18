@@ -18,7 +18,7 @@
 // Main entry point.
 //   var matcher = new Minimongo.Matcher({a: {$gt: 5}});
 //   if (matcher.documentMatches({a: 7})) ...
-Minimongo.Matcher = function (selector) {
+Minimongo.Matcher = function (selector, isUpdate = false) {
   var self = this;
   // A set (object mapping string -> *) of all of the document paths looked
   // at by the selector. Also includes the empty string if it may look at any
@@ -41,6 +41,10 @@ Minimongo.Matcher = function (selector) {
   // Sorter._useWithMatcher.
   self._selector = null;
   self._docMatcher = self._compileSelector(selector);
+  // Set to true if selection is done for an update operation
+  // Default is false
+  // Used for $near array update (issue #3599)
+  self._isUpdate = isUpdate;
 };
 
 _.extend(Minimongo.Matcher.prototype, {
@@ -435,9 +439,10 @@ var VALUE_OPERATORS = {
       throw Error("$near can't be inside another $ operator");
     matcher._hasGeoQuery = true;
 
-    // There are two kinds of geodata in MongoDB: coordinate pairs and
+    // There are two kinds of geodata in MongoDB: legacy coordinate pairs and
     // GeoJSON. They use different distance metrics, too. GeoJSON queries are
-    // marked with a $geometry property.
+    // marked with a $geometry property, though legacy coordinates can be 
+    // matched using $geometry.
 
     var maxDistance, point, distance;
     if (isPlainObject(operand) && _.has(operand, '$geometry')) {
@@ -448,8 +453,11 @@ var VALUE_OPERATORS = {
         // XXX: for now, we don't calculate the actual distance between, say,
         // polygon and circle. If people care about this use-case it will get
         // a priority.
-        if (!value || !value.type)
+        if (!value)
           return null;
+        if(!value.type)
+          return GeoJSON.pointDistance(point,
+            { type: "Point", coordinates: pointToArray(value) });
         if (value.type === "Point") {
           return GeoJSON.pointDistance(point, value);
         } else {
@@ -480,20 +488,29 @@ var VALUE_OPERATORS = {
       // each within-$maxDistance branching point.
       branchedValues = expandArraysInBranches(branchedValues);
       var result = {result: false};
-      _.each(branchedValues, function (branch) {
-        var curDistance = distance(branch.value);
-        // Skip branches that aren't real points or are too far away.
-        if (curDistance === null || curDistance > maxDistance)
-          return;
-        // Skip anything that's a tie.
-        if (result.distance !== undefined && result.distance <= curDistance)
-          return;
+      _.every(branchedValues, function (branch) {
+        // if operation is an update, don't skip branches, just return the first one (#3599)
+        if (!matcher._isUpdate){
+          if (!(typeof branch.value === "object")){
+            return true;
+          }
+          var curDistance = distance(branch.value);
+          // Skip branches that aren't real points or are too far away.
+          if (curDistance === null || curDistance > maxDistance)
+            return true;
+          // Skip anything that's a tie.
+          if (result.distance !== undefined && result.distance <= curDistance)
+            return true;
+        }
         result.result = true;
         result.distance = curDistance;
         if (!branch.arrayIndices)
           delete result.arrayIndices;
         else
           result.arrayIndices = branch.arrayIndices;
+        if (matcher._isUpdate)
+          return false;
+        return true;
       });
       return result;
     };
@@ -550,6 +567,63 @@ var makeInequality = function (cmpValueComparator) {
     }
   };
 };
+
+// Helpers for $bitsAllSet/$bitsAnySet/$bitsAllClear/$bitsAnyClear.
+var getOperandBitmask = function(operand, selector) {
+  // numeric bitmask
+  // You can provide a numeric bitmask to be matched against the operand field. It must be representable as a non-negative 32-bit signed integer.
+  // Otherwise, $bitsAllSet will return an error.
+  if (Number.isInteger(operand) && operand >= 0) {
+    return new Uint8Array(new Int32Array([operand]).buffer)
+  }
+  // bindata bitmask
+  // You can also use an arbitrarily large BinData instance as a bitmask.
+  else if (EJSON.isBinary(operand)) {
+    return new Uint8Array(operand.buffer)
+  }
+  // position list
+  // If querying a list of bit positions, each <position> must be a non-negative integer. Bit positions start at 0 from the least significant bit.
+  else if (isArray(operand) && operand.every(function (e) {
+    return Number.isInteger(e) && e >= 0
+  })) {
+    var buffer = new ArrayBuffer((Math.max(...operand) >> 3) + 1)
+    var view = new Uint8Array(buffer)
+    operand.forEach(function (x) {
+      view[x >> 3] |= (1 << (x & 0x7))
+    })
+    return view
+  }
+  // bad operand
+  else {
+    throw Error(`operand to ${selector} must be a numeric bitmask (representable as a non-negative 32-bit signed integer), a bindata bitmask or an array with bit positions (non-negative integers)`)
+  }
+}
+var getValueBitmask = function (value, length) {
+  // The field value must be either numerical or a BinData instance. Otherwise, $bits... will not match the current document.
+  // numerical
+  if (Number.isSafeInteger(value)) {
+    // $bits... will not match numerical values that cannot be represented as a signed 64-bit integer
+    // This can be the case if a value is either too large or small to fit in a signed 64-bit integer, or if it has a fractional component.
+    var buffer = new ArrayBuffer(Math.max(length, 2 * Uint32Array.BYTES_PER_ELEMENT));
+    var view = new Uint32Array(buffer, 0, 2)
+    view[0] = (value % ((1 << 16) * (1 << 16))) | 0
+    view[1] = (value / ((1 << 16) * (1 << 16))) | 0
+    // sign extension
+    if (value < 0) {
+      view = new Uint8Array(buffer, 2)
+      view.forEach(function (byte, idx) {
+        view[idx] = 0xff
+      })
+    }
+    return new Uint8Array(buffer)
+  }
+  // bindata
+  else if (EJSON.isBinary(value)) {
+    return new Uint8Array(value.buffer)
+  }
+  // no match
+  return false
+}
 
 // Each element selector contains:
 //  - compileElementSelector, a function with args:
@@ -647,6 +721,50 @@ ELEMENT_OPERATORS = {
         return value !== undefined
           && LocalCollection._f._type(value) === operand;
       };
+    }
+  },
+  $bitsAllSet: {
+    compileElementSelector: function (operand) {
+      var op = getOperandBitmask(operand, '$bitsAllSet')
+      return function (value) {
+        var bitmask = getValueBitmask(value, op.length)
+        return bitmask && op.every(function (byte, idx) {
+          return ((bitmask[idx] & byte) == byte)
+        })
+      }
+    }
+  },
+  $bitsAnySet: {
+    compileElementSelector: function (operand) {
+      var query = getOperandBitmask(operand, '$bitsAnySet')
+      return function (value) {
+        var bitmask = getValueBitmask(value, query.length)
+        return bitmask && query.some(function (byte, idx) {
+          return ((~bitmask[idx] & byte) !== byte)
+        })
+      }
+    }
+  },
+  $bitsAllClear: {
+    compileElementSelector: function (operand) {
+      var query = getOperandBitmask(operand, '$bitsAllClear')
+      return function (value) {
+        var bitmask = getValueBitmask(value, query.length)
+        return bitmask && query.every(function (byte, idx) {
+          return !(bitmask[idx] & byte)
+        })
+      }
+    }
+  },
+  $bitsAnyClear: {
+    compileElementSelector: function (operand) {
+      var query = getOperandBitmask(operand, '$bitsAnyClear')
+      return function (value) {
+        var bitmask = getValueBitmask(value, query.length)
+        return bitmask && query.some(function (byte, idx) {
+          return ((bitmask[idx] & byte) !== byte)
+        })
+      }
     }
   },
   $regex: {
@@ -1135,9 +1253,9 @@ LocalCollection._f = {
 
 // Oddball function used by upsert.
 LocalCollection._removeDollarOperators = function (selector) {
-  var selectorDoc = {};
-  for (var k in selector)
-    if (k.substr(0, 1) !== '$')
-      selectorDoc[k] = selector[k];
-  return selectorDoc;
+  return JSON.parse(JSON.stringify(selector, (key, value) => {
+    if (! key.startsWith("$")) {
+      return value;
+    }
+  }));
 };
